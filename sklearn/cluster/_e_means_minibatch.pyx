@@ -402,26 +402,34 @@ def _ema_update(
         int n_clusters = centers.shape[0]
         int n_features = centers.shape[1]
 
+        # The computations are done with the precision of the data.
+        floating alpha = learning_rate
         floating decay = 1 - learning_rate
-        floating new_weight, step_size
+        floating batch_weight, new_weight, step_size, shift
         int j, k
 
     for j in range(n_clusters):
+        # With a learning rate of 1, the past of the clusters with samples in
+        # the mini-batch is forgotten, and the running weights of the other
+        # clusters are kept.
+        if learning_rate < 1:
+            running_weights[j] *= decay
+
         if weight_sums[j] > 0:
+            batch_weight = alpha * weight_sums[j]
             if learning_rate < 1:
-                new_weight = decay * running_weights[j] + learning_rate * weight_sums[j]
+                new_weight = running_weights[j] + batch_weight
             else:
-                # The running weights of the other clusters are kept.
                 new_weight = weight_sums[j]
             running_weights[j] = new_weight
 
             # c_j <- c_j + step_size * (s_j / n_j - c_j)
-            step_size = learning_rate * weight_sums[j] / new_weight
+            step_size = batch_weight / new_weight
             if step_size == 1:
                 for k in range(n_features):
                     centers[j, k] = sums[j, k] / weight_sums[j]
             else:
                 for k in range(n_features):
-                    centers[j, k] += step_size * (sums[j, k] / weight_sums[j] - centers[j, k])
-        elif learning_rate < 1:
-            running_weights[j] *= decay
+                    shift = sums[j, k] / weight_sums[j] - centers[j, k]
+                    shift *= step_size
+                    centers[j, k] += shift
