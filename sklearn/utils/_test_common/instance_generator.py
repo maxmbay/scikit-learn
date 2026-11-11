@@ -19,6 +19,7 @@ from sklearn.cluster import (
     AgglomerativeClustering,
     Birch,
     BisectingKMeans,
+    EMeans,
     FeatureAgglomeration,
     KMeans,
     MeanShift,
@@ -214,6 +215,7 @@ INIT_PARAMS = {
     # the default strategy prior would output constant predictions and fail
     # for check_classifiers_predictions
     DummyClassifier: [dict(strategy="stratified"), dict(strategy="most_frequent")],
+    EMeans: dict(n_clusters=2, n_epochs=2),
     ElasticNetCV: dict(max_iter=5, cv=3),
     ElasticNet: dict(max_iter=5),
     ExtraTreesClassifier: dict(n_estimators=5),
@@ -979,6 +981,15 @@ PER_ESTIMATOR_XFAIL_CHECKS: dict[type, dict[str, str]] = {
     DummyClassifier: {
         "check_methods_subset_invariance": "fails for the predict method",
         "check_methods_sample_order_invariance": "fails for the predict method",
+    },
+    EMeans: {
+        # TODO: replace by a statistical test, see meta-issue #16298
+        "check_sample_weight_equivalence_on_dense_data": (
+            "sample_weight is not equivalent to removing/repeating samples."
+        ),
+        "check_sample_weight_equivalence_on_sparse_data": (
+            "sample_weight is not equivalent to removing/repeating samples."
+        ),
     },
     FeatureUnion: {
         # Fails because StandardScaler, which gets wrapped by FeatureUnion, supports

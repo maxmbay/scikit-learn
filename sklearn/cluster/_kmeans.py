@@ -1478,6 +1478,9 @@ class KMeans(_BaseKMeans):
         updates of the centers positions using mini-batches.
         For large scale learning (say n_samples > 10k) MiniBatchKMeans is
         probably much faster than the default batch implementation.
+    EMeans : Mini-batch implementation that updates the centers with
+        exponential moving averages, with a batch size and a learning rate set
+        by scaling laws.
 
     Notes
     -----
@@ -1986,6 +1989,9 @@ class MiniBatchKMeans(_BaseKMeans):
     KMeans : The classic implementation of the clustering method based on the
         Lloyd's algorithm. It consumes the whole set of input data at each
         iteration.
+    EMeans : Mini-batch implementation that updates the centers with
+        exponential moving averages, with a batch size and a learning rate set
+        by scaling laws.
 
     Notes
     -----
