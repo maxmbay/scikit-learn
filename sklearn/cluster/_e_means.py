@@ -320,6 +320,9 @@ class EMeans(_BaseKMeans):
     >>> emeans.cluster_centers_
     array([[ 1.,  2.],
            [10.,  2.]])
+
+    For a comparison of E-Means with K-Means and MiniBatchKMeans, see
+    :ref:`sphx_glr_auto_examples_cluster_plot_e_means.py`.
     """
 
     _parameter_constraints: dict = {

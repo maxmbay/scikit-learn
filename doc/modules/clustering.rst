@@ -364,6 +364,33 @@ The authors report that e-means reaches the inertia of Lloyd's algorithm after 2
 iterations in 1.4 to 2.6 passes over the data on a wide range of embedding
 datasets.
 
+.. figure:: ../auto_examples/cluster/images/sphx_glr_plot_e_means_001.png
+   :target: ../auto_examples/cluster/plot_e_means.html
+   :align: center
+   :scale: 75
+
+An epoch of :class:`EMeans` costs about as much as an iteration of Lloyd's
+algorithm: :math:`O(n_{samples} \, n_{clusters} \, n_{features})` for dense data.
+For sparse data with :math:`nnz` non-zero values, it costs
+:math:`O(nnz \, n_{clusters})`, plus :math:`O(n_{clusters} \, n_{features})` at
+each mini-batch to update the centroids. A fit makes ``n_epochs`` passes over the
+data, and a last one to compute ``labels_`` and ``inertia_``. The data is not
+copied, and the additional memory is
+:math:`O(n_{clusters} \, n_{features} + n_{samples})`. Like :class:`KMeans`,
+:class:`EMeans` scales to a very large number of samples, and its cost grows
+linearly with the number of clusters and with the number of features.
+
+The samples of a mini-batch are assigned to their closest centroid in parallel
+with OpenMP, in chunks of 256 samples, when the mini-batches are large enough for
+this to be faster than a single thread. The result does not depend on the number
+of threads. For more details on how to control the number of threads, please
+refer to our :ref:`parallelism` notes.
+
+.. rubric:: Examples
+
+* :ref:`sphx_glr_auto_examples_cluster_plot_e_means.py`: Comparison of
+  :class:`EMeans`, :class:`KMeans` and :class:`MiniBatchKMeans`
+
 .. dropdown:: References
 
   * :arxiv:`"e-means: outperforming k-means (in one-tenth the epochs)"
