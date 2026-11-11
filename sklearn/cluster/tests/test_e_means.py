@@ -68,6 +68,47 @@ def test_e_means_full_batch_is_lloyd_iteration(array_constr):
     assert_allclose(emeans.cluster_centers_, expected_centers)
 
 
+def test_e_means_reference_implementation():
+    # Check the centers against those of the reference implementation in faiss,
+    # `NumpyEmeans(3, 6, nepochs=5, seed=0)` from `faiss.contrib.e_means`, on the
+    # same data, from the same initial centers and with the same random numbers.
+    rng = np.random.RandomState(0)
+    X = rng.normal(size=(300, 3)) + 5 * rng.randint(3, size=(300, 1))
+    X = X.astype(np.float32)
+
+    class ReferenceRandomState(np.random.RandomState):
+        # The reference implementation shuffles the samples of each epoch with a
+        # RandomState seeded from its seed and the epoch, and draws the random
+        # numbers used to reassign clusters from RandomState(seed).
+        def __init__(self, seed):
+            super().__init__(seed)
+            self._seed = seed
+            self._epoch = 0
+
+        def permutation(self, n_samples):
+            epoch_seed = (self._seed * 1000003 + self._epoch) % 2**32
+            self._epoch += 1
+            return np.random.RandomState(epoch_seed).permutation(n_samples)
+
+    init = X[np.random.RandomState(0).permutation(X.shape[0])[:6]]
+    emeans = EMeans(n_clusters=6, init=init, random_state=ReferenceRandomState(0))
+    emeans.fit(X)
+
+    # One cluster is reassigned during this run of the reference implementation.
+    expected_centers = [
+        [0.45666954, -1.0414114, -0.24914086],
+        [6.292352, 5.3675885, 4.991632],
+        [10.135136, 9.889491, 9.988427],
+        [5.062959, 4.2198195, 4.6458964],
+        [4.0048666, 5.6055803, 4.815979],
+        [-0.5204016, 0.560384, -0.11574496],
+    ]
+    assert emeans.batch_size_ == 4
+    assert emeans.learning_rate_init_ == pytest.approx(0.0814347731973082)
+    assert emeans.n_steps_ == 375
+    assert_allclose(emeans.cluster_centers_, expected_centers)
+
+
 @pytest.mark.parametrize(
     "n_samples, n_features, n_clusters, n_epochs, batch_size, "
     "expected_batch_size, expected_learning_rate",
