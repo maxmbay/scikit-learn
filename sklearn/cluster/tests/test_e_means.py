@@ -1,16 +1,19 @@
 """Tests for EMeans."""
 
+import re
+
 import numpy as np
 import pytest
+import scipy.sparse as sp
 from threadpoolctl import threadpool_limits
 
 from sklearn.cluster import EMeans
-from sklearn.cluster._e_means import (
+from sklearn.cluster._e_means import _scheduled_learning_rate, _split_unused_clusters
+from sklearn.cluster._e_means_minibatch import (
     _ema_update,
-    _scheduled_learning_rate,
-    _split_unused_clusters,
+    _minibatch_statistics_dense,
+    _minibatch_statistics_sparse,
 )
-from sklearn.cluster._kmeans import _labels_inertia
 from sklearn.datasets import make_blobs
 from sklearn.metrics import pairwise_distances_argmin
 from sklearn.metrics.cluster import v_measure_score
@@ -137,13 +140,64 @@ def test_scheduled_learning_rate():
     assert np.all(np.diff(learning_rates) < 0)
 
 
-def test_ema_update():
+@pytest.mark.parametrize("array_constr", data_containers)
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("n_threads", [1, 2])
+def test_minibatch_statistics(array_constr, dtype, n_threads):
+    # Check the labels, the sums, the weights and the inertia of a mini-batch
+    # against their computation with numpy.
+    rng = np.random.RandomState(0)
+    n_samples, n_features, n_clusters = 2000, 5, 7
+    X = rng.uniform(size=(n_samples, n_features)).astype(dtype)
+    sample_weight = rng.uniform(0.5, 2, size=n_samples).astype(dtype)
+    centers = rng.uniform(size=(n_clusters, n_features)).astype(dtype)
+    # A mini-batch of 3 chunks, the last one being smaller than the others.
+    indices = rng.permutation(n_samples)[:700].astype(np.intp)
+
+    X_container = array_constr(X)
+    minibatch_statistics = (
+        _minibatch_statistics_sparse
+        if sp.issparse(X_container)
+        else _minibatch_statistics_dense
+    )
+    sums = np.full_like(centers, np.nan)
+    weight_sums = np.full(n_clusters, np.nan, dtype=dtype)
+    labels = np.full(indices.shape[0], -1, dtype=np.int32)
+    inertia = minibatch_statistics(
+        X_container,
+        sample_weight,
+        indices,
+        centers,
+        sums,
+        weight_sums,
+        labels,
+        n_threads,
+        compute_inertia=True,
+    )
+
+    X_batch, sample_weight_batch = X[indices], sample_weight[indices]
+    expected_labels = pairwise_distances_argmin(X_batch, centers)
+    expected_sums = np.zeros_like(centers)
+    np.add.at(expected_sums, expected_labels, sample_weight_batch[:, None] * X_batch)
+    expected_weight_sums = np.bincount(
+        expected_labels, weights=sample_weight_batch, minlength=n_clusters
+    )
+    sq_distances = ((X_batch - centers[expected_labels]) ** 2).sum(axis=1)
+
+    assert_array_equal(labels, expected_labels)
+    assert_allclose(sums, expected_sums)
+    assert_allclose(weight_sums, expected_weight_sums)
+    assert inertia == pytest.approx(sample_weight_batch @ sq_distances, rel=1e-4)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_ema_update(dtype):
     # Check the update against the exponential moving averages of the sums and
     # weights of the samples of each cluster.
-    centers = np.array([[0.0, 0.0], [5.0, 5.0]])
-    running_weights = np.array([2.0, 4.0])
-    weight_sums = np.array([2.0, 0.0])
-    sums = np.array([[2.0, 4.0], [0.0, 0.0]])
+    centers = np.array([[0.0, 0.0], [5.0, 5.0]], dtype=dtype)
+    running_weights = np.array([2.0, 4.0], dtype=dtype)
+    weight_sums = np.array([2.0, 0.0], dtype=dtype)
+    sums = np.array([[2.0, 4.0], [0.0, 0.0]], dtype=dtype)
 
     _ema_update(centers, running_weights, weight_sums, sums, learning_rate=0.5)
 
@@ -285,10 +339,15 @@ def test_e_means_dense_sparse_equivalence():
     assert_allclose(centers_dense, centers_sparse)
 
 
-def test_e_means_n_threads():
-    # Check that the result does not depend on the number of threads.
-    X, _ = make_blobs(n_samples=2000, centers=10, n_features=5, random_state=0)
-    emeans = EMeans(n_clusters=10, random_state=0)
+@pytest.mark.parametrize("array_constr", data_containers)
+def test_e_means_n_threads(array_constr, monkeypatch):
+    # Check that the result does not depend on the number of threads: the
+    # samples of a mini-batch are assigned in parallel but summed sequentially.
+    X, _ = make_blobs(n_samples=3000, centers=10, n_features=5, random_state=0)
+    X = array_constr(X)
+    # Use several threads even though the mini-batches are small.
+    monkeypatch.setattr("sklearn.cluster._e_means._MIN_BATCH_WORK_FOR_THREADS", 0)
+    emeans = EMeans(n_clusters=10, batch_size=1024, random_state=0)
 
     with threadpool_limits(limits=1, user_api="openmp"):
         centers_1 = emeans.fit(X).cluster_centers_
@@ -304,11 +363,14 @@ def test_e_means_batch_n_threads(monkeypatch):
     X = np.random.RandomState(0).uniform(size=(1000, 2))
     n_threads_used = set()
 
-    def labels_inertia(X, sample_weight, centers, n_threads=1, return_inertia=True):
-        n_threads_used.add(n_threads)
-        return _labels_inertia(X, sample_weight, centers, n_threads, return_inertia)
+    def minibatch_statistics(*args, **kwargs):
+        # n_threads is the 8th positional argument.
+        n_threads_used.add(args[7])
+        return _minibatch_statistics_dense(*args, **kwargs)
 
-    monkeypatch.setattr("sklearn.cluster._e_means._labels_inertia", labels_inertia)
+    monkeypatch.setattr(
+        "sklearn.cluster._e_means._minibatch_statistics_dense", minibatch_statistics
+    )
     EMeans(n_clusters=3, n_epochs=1).fit(X)
     assert n_threads_used == {1}
 
@@ -318,13 +380,21 @@ def test_e_means_batch_n_threads(monkeypatch):
     assert n_threads_used == {_openmp_effective_n_threads()}
 
 
-def test_e_means_verbose(capsys):
+@pytest.mark.parametrize("array_constr", data_containers)
+def test_e_means_verbose(array_constr, capsys):
     X = np.random.RandomState(0).uniform(size=(100, 2))
-    EMeans(n_clusters=3, n_epochs=2, verbose=1).fit(X)
+    init = X[:3].copy()
+    EMeans(n_clusters=3, init=init, n_epochs=2, batch_size=100, verbose=1).fit(
+        array_constr(X)
+    )
 
     captured = capsys.readouterr().out
-    assert "batch_size=" in captured
+    assert "batch_size=100" in captured
     assert "Epoch 2/2" in captured
+    # The inertia of the first epoch is computed with the initial centers.
+    inertia = float(re.search(r"Epoch 1/2: inertia ([^,]+),", captured).group(1))
+    labels = pairwise_distances_argmin(X, init)
+    assert inertia == pytest.approx(((X - init[labels]) ** 2).sum())
 
 
 def test_e_means_n_samples_lt_n_clusters():

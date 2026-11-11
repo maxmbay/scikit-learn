@@ -11,12 +11,13 @@ import numpy as np
 import scipy.sparse as sp
 
 from sklearn.base import _fit_context
-from sklearn.cluster._k_means_common import CHUNK_SIZE
-from sklearn.cluster._kmeans import (
-    _BaseKMeans,
-    _labels_inertia,
-    _labels_inertia_threadpool_limit,
+from sklearn.cluster._e_means_minibatch import (
+    _ema_update,
+    _minibatch_statistics_dense,
+    _minibatch_statistics_sparse,
 )
+from sklearn.cluster._k_means_common import CHUNK_SIZE
+from sklearn.cluster._kmeans import _BaseKMeans, _labels_inertia_threadpool_limit
 from sklearn.utils._openmp_helpers import _openmp_effective_n_threads
 from sklearn.utils._param_validation import Interval, StrOptions
 from sklearn.utils.extmath import row_norms
@@ -127,47 +128,6 @@ def _scheduled_learning_rate(learning_rate_init, step, n_steps):
     cosine = 0.5 * (1 + math.cos(math.pi * min(step, n_steps) / max(n_steps, 1)))
     ratio = _FINAL_LEARNING_RATE_RATIO
     return learning_rate_init * (ratio + (1 - ratio) * cosine)
-
-
-def _cluster_weights_and_sums(X, sample_weight, labels, n_clusters):
-    """Sum of the weights and weighted sum of the samples of each cluster."""
-    n_samples = X.shape[0]
-    # Each row holds the weights of the samples assigned to a cluster.
-    membership = sp.csr_array(
-        (sample_weight, (labels, np.arange(n_samples))),
-        shape=(n_clusters, n_samples),
-    )
-    sums = membership @ X
-    if sp.issparse(sums):
-        sums = sums.toarray()
-    weight_sums = np.bincount(labels, weights=sample_weight, minlength=n_clusters)
-    return weight_sums.astype(X.dtype, copy=False), sums
-
-
-def _ema_update(centers, running_weights, weight_sums, sums, learning_rate):
-    """Update the centers with the statistics of a mini-batch, in place.
-
-    The running weight N_j and the running sum S_j of the samples assigned to
-    cluster j are exponential moving averages of the weight n_j and the sum s_j
-    of the samples of the mini-batch assigned to it, and the center of the
-    cluster is S_j / N_j:
-
-        N_j <- (1 - learning_rate) * N_j + learning_rate * n_j
-        S_j <- (1 - learning_rate) * S_j + learning_rate * s_j
-
-    The centers of the clusters without samples in the mini-batch do not move.
-    """
-    updated = weight_sums > 0
-    if learning_rate < 1:
-        running_weights *= 1 - learning_rate
-        new_weights = running_weights[updated] + learning_rate * weight_sums[updated]
-    else:
-        # The running weights of the other clusters are kept.
-        new_weights = weight_sums[updated]
-    step_sizes = learning_rate * weight_sums[updated] / new_weights
-    means = sums[updated] / weight_sums[updated, None]
-    centers[updated] += step_sizes[:, None] * (means - centers[updated])
-    running_weights[updated] = new_weights
 
 
 def _split_unused_clusters(centers, running_weights, reassignment_ratio, random_state):
@@ -532,39 +492,40 @@ class EMeans(_BaseKMeans):
                 f"{n_steps} minibatch steps in {len(epoch_sizes)} epochs."
             )
 
+        if sp.issparse(X):
+            minibatch_statistics = _minibatch_statistics_sparse
+        else:
+            minibatch_statistics = _minibatch_statistics_dense
+
+        # Buffers for the statistics of a mini-batch.
+        sums = np.empty_like(centers)
+        weight_sums = np.empty(self.n_clusters, dtype=X.dtype)
+        labels = np.empty(self._batch_size, dtype=np.int32)
+        # Statistics of the clusters during the last epoch.
+        epoch_sums = np.zeros_like(centers)
+        epoch_weight_sums = np.zeros(self.n_clusters, dtype=X.dtype)
+
         step = 0
         with _get_threadpool_controller().limit(limits="sequential_blas_under_openmp"):
             for epoch, epoch_size in enumerate(epoch_sizes):
+                is_last_epoch = epoch == len(epoch_sizes) - 1
                 indices = random_state.permutation(n_samples)[:epoch_size]
-                # After the last epoch, these hold the statistics of the
-                # clusters during the last epoch.
-                epoch_weight_sums = np.zeros(self.n_clusters, dtype=X.dtype)
-                epoch_sums = np.zeros_like(centers)
+                indices = indices.astype(np.intp, copy=False)
                 epoch_inertia = 0
                 n_reassigned = 0
 
                 for start in range(0, epoch_size, self._batch_size):
-                    batch_indices = indices[start : start + self._batch_size]
-                    X_batch = X[batch_indices]
-                    sample_weight_batch = sample_weight[batch_indices]
-
-                    # The inertia of the batch is only used for verbose output:
-                    # computing it is costly with small batches and many threads.
-                    if self.verbose:
-                        labels, batch_inertia = _labels_inertia(
-                            X_batch, sample_weight_batch, centers, n_threads_batch
-                        )
-                        epoch_inertia += batch_inertia
-                    else:
-                        labels = _labels_inertia(
-                            X_batch,
-                            sample_weight_batch,
-                            centers,
-                            n_threads_batch,
-                            return_inertia=False,
-                        )
-                    weight_sums, sums = _cluster_weights_and_sums(
-                        X_batch, sample_weight_batch, labels, self.n_clusters
+                    # The inertia of the batch is only used for verbose output.
+                    epoch_inertia += minibatch_statistics(
+                        X,
+                        sample_weight,
+                        indices[start : start + self._batch_size],
+                        centers,
+                        sums,
+                        weight_sums,
+                        labels,
+                        n_threads_batch,
+                        compute_inertia=bool(self.verbose),
                     )
                     learning_rate = _scheduled_learning_rate(
                         self._learning_rate_init, step, n_steps
@@ -572,8 +533,9 @@ class EMeans(_BaseKMeans):
                     _ema_update(
                         centers, running_weights, weight_sums, sums, learning_rate
                     )
-                    epoch_weight_sums += weight_sums
-                    epoch_sums += sums
+                    if is_last_epoch:
+                        epoch_weight_sums += weight_sums
+                        epoch_sums += sums
                     step += 1
 
                     if (
