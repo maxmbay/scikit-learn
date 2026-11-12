@@ -178,6 +178,8 @@ class EMeans(_BaseKMeans):
     learning rate are set by empirical scaling laws, so that the number of
     passes over the data, `n_epochs`, is in general the only parameter to set.
 
+    Read more in the :ref:`User Guide <e_means>`.
+
     .. versionadded:: 1.10
 
     Parameters
@@ -291,6 +293,9 @@ class EMeans(_BaseKMeans):
     >>> emeans.cluster_centers_
     array([[ 1.,  2.],
            [10.,  2.]])
+
+    For a comparison of E-Means with K-Means and MiniBatchKMeans, see
+    :ref:`sphx_glr_auto_examples_cluster_plot_e_means.py`.
     """
 
     _parameter_constraints: dict = {
