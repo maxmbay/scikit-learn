@@ -50,7 +50,7 @@ Overview of clustering methods
    * - :ref:`K-Means <k_means>`
      - number of clusters
      - Very large ``n_samples``, medium ``n_clusters`` with
-       :ref:`MiniBatch code <mini_batch_kmeans>` or :ref:`E-Means <e_means>`
+       :ref:`MiniBatch code <mini_batch_kmeans>`
      - General-purpose, even cluster size, flat geometry,
        not too many clusters, inductive
      - Distances between points
@@ -323,81 +323,6 @@ small, as shown in the example and cited reference.
     <https://www.ccs.neu.edu/home/vip/teach/DMcourse/2_cluster_EM_mixt/notes_slides/sculey_webscale_kmeans_approx.pdf>`_
     D. Sculley, *Proceedings of the 19th international conference on World
     wide web* (2010).
-
-.. _e_means:
-
-E-Means
--------
-
-:class:`EMeans` is a mini-batch variant of :class:`KMeans` in which each centroid
-is the ratio of two exponential moving averages, computed over the mini-batches:
-the running sum :math:`S_j` and the running weight :math:`N_j` of the samples
-assigned to cluster :math:`j`. With :math:`s_j` and :math:`n_j` the sum and the
-weight of the samples of a mini-batch assigned to the cluster, and
-:math:`\alpha` the learning rate, each mini-batch updates them as:
-
-.. math::
-
-    S_j \leftarrow (1 - \alpha) S_j + \alpha s_j, \qquad
-    N_j \leftarrow (1 - \alpha) N_j + \alpha n_j, \qquad
-    \mu_j = S_j / N_j.
-
-With a single mini-batch holding all the samples and :math:`\alpha = 1`, this is
-an iteration of Lloyd's algorithm. Unlike :class:`MiniBatchKMeans`, whose
-learning rate decreases as the inverse of the number of samples seen by each
-centroid, the learning rate of e-means is shared by all the centroids and follows
-a cosine decay, from its initial value to a tenth of it, over a number of passes
-over the data set by ``n_epochs``. Every 5 mini-batches, the clusters that
-receive too few samples are reassigned by splitting a heavily used cluster in
-two, and at the end of the last epoch, each centroid is set to the mean of the
-samples assigned to it during that epoch.
-
-The batch size and the initial learning rate are set by scaling laws that the
-authors of e-means fitted as functions of the number of samples, clusters and
-epochs, so that ``n_epochs`` is in general the only parameter to set.
-``batch_size="quality"`` uses batches about 8 times smaller than
-``batch_size="throughput"``, which reaches a lower inertia at the cost of more
-updates of the centroids. By default, "quality" is used for data with up to 16
-features, and "throughput" otherwise.
-
-The authors report that e-means reaches the inertia of Lloyd's algorithm after 25
-iterations in 1.4 to 2.6 passes over the data on a wide range of embedding
-datasets.
-
-.. figure:: ../auto_examples/cluster/images/sphx_glr_plot_e_means_001.png
-   :target: ../auto_examples/cluster/plot_e_means.html
-   :align: center
-   :scale: 75
-
-An epoch of :class:`EMeans` costs about as much as an iteration of Lloyd's
-algorithm: :math:`O(n_{samples} \, n_{clusters} \, n_{features})` for dense data.
-For sparse data with :math:`nnz` non-zero values, it costs
-:math:`O(nnz \, n_{clusters})`, plus :math:`O(n_{clusters} \, n_{features})` at
-each mini-batch to update the centroids. A fit makes ``n_epochs`` passes over the
-data, and a last one to compute ``labels_`` and ``inertia_``. The data is not
-copied, and the additional memory is
-:math:`O(n_{clusters} \, n_{features} + n_{samples})`. Like :class:`KMeans`,
-:class:`EMeans` scales to a very large number of samples, and its cost grows
-linearly with the number of clusters and with the number of features.
-
-The samples of a mini-batch are assigned to their closest centroid in parallel
-with OpenMP, in chunks of 256 samples, when the mini-batches are large enough for
-this to be faster than a single thread. The result does not depend on the number
-of threads. For more details on how to control the number of threads, please
-refer to our :ref:`parallelism` notes.
-
-.. rubric:: Examples
-
-* :ref:`sphx_glr_auto_examples_cluster_plot_e_means.py`: Comparison of
-  :class:`EMeans`, :class:`KMeans` and :class:`MiniBatchKMeans`
-
-.. dropdown:: References
-
-  * :arxiv:`"e-means: outperforming k-means (in one-tenth the epochs)"
-    <2611.09501>`
-    S. Bessa, P.-E. Mazaré, G. Szilvasy, H. Touvron, D. Picard, M. Douze,
-    H. Jégou (2026). The reference implementation is available in `faiss
-    <https://github.com/facebookresearch/faiss/tree/main/contrib/e_means>`_.
 
 .. _affinity_propagation:
 
