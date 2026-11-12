@@ -52,14 +52,16 @@ _REASSIGNMENT_PERIOD = 5
 # Relative perturbation of the coordinates of a center split in two.
 _SPLIT_PERTURBATION = 1e-4
 
-# With batch_size="auto", the "quality" law is used up to this number of
+# The "quality" law, with batches 8 times smaller, is used up to this number of
 # features, and the "throughput" law above.
-_AUTO_QUALITY_MAX_FEATURES = 16
+_QUALITY_MAX_FEATURES = 16
 
-# With reassignment_ratio="auto", reassignments are disabled up to this number
-# of features.
-_AUTO_NO_REASSIGNMENT_MAX_FEATURES = 2
-_AUTO_REASSIGNMENT_RATIO = 0.1
+# A cluster is unused when its running weight is below this fraction of the mean
+# running weight.
+_REASSIGNMENT_RATIO = 0.1
+
+# Unused clusters are not reassigned up to this number of features.
+_NO_REASSIGNMENT_MAX_FEATURES = 2
 
 # The assignment of the samples of a mini-batch to their closest center only
 # uses several threads when batch_size * n_clusters * n_features is at least
@@ -124,10 +126,10 @@ def _scheduled_learning_rate(learning_rate_init, step, n_steps):
     return learning_rate_init * (ratio + (1 - ratio) * cosine)
 
 
-def _split_unused_clusters(centers, running_weights, reassignment_ratio, random_state):
+def _split_unused_clusters(centers, running_weights, random_state):
     """Reassign the unused clusters by splitting heavily used clusters in two.
 
-    A cluster is unused when its running weight is below `reassignment_ratio`
+    A cluster is unused when its running weight is below `_REASSIGNMENT_RATIO`
     times the mean running weight. Each unused cluster is reassigned to a
     donor cluster, sampled without replacement with a probability proportional
     to its running weight: the two clusters share the running weight of the
@@ -137,7 +139,7 @@ def _split_unused_clusters(centers, running_weights, reassignment_ratio, random_
     Returns the number of reassigned clusters.
     """
     n_clusters, n_features = centers.shape
-    threshold = reassignment_ratio * running_weights.sum() / n_clusters
+    threshold = _REASSIGNMENT_RATIO * running_weights.sum() / n_clusters
     unused = running_weights < threshold
     can_donate = ~unused & (running_weights > 0)
     n_reassigned = min(np.count_nonzero(unused), np.count_nonzero(can_donate))
@@ -213,28 +215,11 @@ class EMeans(_BaseKMeans):
         the fractional part is a pass over a random subset of the samples. The
         batch size, the learning rate and its decay depend on `n_epochs`.
 
-    batch_size : int or {"auto", "quality", "throughput"}, default="auto"
-        Number of samples per mini-batch. If a string, the batch size is set by
-        an empirical scaling law of the number of samples, clusters and epochs:
-
-        - "throughput" favors speed;
-        - "quality" uses batches about 8 times smaller, which reaches a lower
-          inertia at the cost of more updates of the centers;
-        - "auto" uses "quality" when `n_features <= 16` and "throughput"
-          otherwise.
-
-    learning_rate_init : float, default=None
-        Initial learning rate, in (0, 1]. It is the step size of the
-        exponential moving averages, and it decreases to a tenth of its initial
-        value along a cosine schedule. If None, it is set from the batch size by
-        an empirical scaling law.
-
-    reassignment_ratio : float or "auto", default="auto"
-        Every 5 mini-batches, the clusters whose running weight is below
-        `reassignment_ratio` times the mean running weight are reassigned by
-        splitting heavily used clusters in two. Set to 0 to disable the
-        reassignments. "auto" uses 0.1, except when `n_features <= 2` where it
-        disables the reassignments.
+    batch_size : int or "auto", default="auto"
+        Number of samples per mini-batch. "auto" sets it by an empirical scaling
+        law of the number of samples, clusters and epochs, with batches about 8
+        times smaller when `n_features <= 16`. The initial learning rate is set
+        from the batch size by another scaling law.
 
     random_state : int, RandomState instance or None, default=None
         Determines random number generation for centroid initialization, for
@@ -255,9 +240,6 @@ class EMeans(_BaseKMeans):
 
     batch_size_ : int
         Batch size used during fit.
-
-    learning_rate_init_ : float
-        Initial learning rate used during fit.
 
     n_steps_ : int
         Number of minibatches processed.
@@ -284,6 +266,12 @@ class EMeans(_BaseKMeans):
     to 2.6 passes over the data. This implementation follows the reference
     implementation in faiss:
     https://github.com/facebookresearch/faiss/tree/main/contrib/e_means
+
+    The learning rate is the step size of the exponential moving averages. It
+    decreases to a tenth of its initial value along a cosine schedule. Every 5
+    mini-batches, the clusters whose running weight is below a tenth of the mean
+    running weight are reassigned by splitting heavily used clusters in two,
+    except when `n_features <= 2`.
 
     At the end of the last epoch, each center is set to the mean of the samples
     assigned to it during that epoch. Then, like :class:`MiniBatchKMeans`, an
@@ -321,11 +309,6 @@ class EMeans(_BaseKMeans):
         "n_epochs": [Interval(Real, 0, None, closed="neither")],
         "batch_size": [
             Interval(Integral, 1, None, closed="left"),
-            StrOptions({"auto", "quality", "throughput"}),
-        ],
-        "learning_rate_init": [Interval(Real, 0, 1, closed="right"), None],
-        "reassignment_ratio": [
-            Interval(Real, 0, None, closed="left"),
             StrOptions({"auto"}),
         ],
         "random_state": ["random_state"],
@@ -338,16 +321,12 @@ class EMeans(_BaseKMeans):
         init="random",
         n_epochs=5,
         batch_size="auto",
-        learning_rate_init=None,
-        reassignment_ratio="auto",
         random_state=None,
     ):
         self.n_clusters = n_clusters
         self.init = init
         self.n_epochs = n_epochs
         self.batch_size = batch_size
-        self.learning_rate_init = learning_rate_init
-        self.reassignment_ratio = reassignment_ratio
         self.random_state = random_state
 
     def _check_params_vs_input(self, X):
@@ -357,33 +336,17 @@ class EMeans(_BaseKMeans):
                 f"n_samples={n_samples} should be >= n_clusters={self.n_clusters}."
             )
 
-        if isinstance(self.batch_size, str):
-            law = self.batch_size
-            if law == "auto":
-                law = (
-                    "quality"
-                    if n_features <= _AUTO_QUALITY_MAX_FEATURES
-                    else "throughput"
-                )
+        if self.batch_size == "auto":
+            law = "quality" if n_features <= _QUALITY_MAX_FEATURES else "throughput"
             self._batch_size = _batch_size_law(
                 law, n_samples, self.n_clusters, self.n_epochs
             )
         else:
             self._batch_size = min(self.batch_size, n_samples)
 
-        self._learning_rate_init = self.learning_rate_init
-        if self._learning_rate_init is None:
-            self._learning_rate_init = _learning_rate_law(
-                n_samples, self.n_clusters, self.n_epochs, self._batch_size
-            )
-
-        self._reassignment_ratio = self.reassignment_ratio
-        if self._reassignment_ratio == "auto":
-            self._reassignment_ratio = (
-                0.0
-                if n_features <= _AUTO_NO_REASSIGNMENT_MAX_FEATURES
-                else _AUTO_REASSIGNMENT_RATIO
-            )
+        self._learning_rate_init = _learning_rate_law(
+            n_samples, self.n_clusters, self.n_epochs, self._batch_size
+        )
 
     def _warn_mkl_vcomp(self, n_active_threads):
         """Warn when vcomp and mkl are both present"""
@@ -456,6 +419,7 @@ class EMeans(_BaseKMeans):
 
         epoch_sizes = _epoch_sizes(n_samples, self.n_epochs)
         n_steps = sum(math.ceil(size / self._batch_size) for size in epoch_sizes)
+        reassign = X.shape[1] > _NO_REASSIGNMENT_MAX_FEATURES
 
         # Buffers for the statistics of a mini-batch.
         sums = np.empty_like(centers)
@@ -491,16 +455,8 @@ class EMeans(_BaseKMeans):
                         epoch_sums += sums
                     step += 1
 
-                    if (
-                        self._reassignment_ratio > 0
-                        and step % _REASSIGNMENT_PERIOD == 0
-                    ):
-                        _split_unused_clusters(
-                            centers,
-                            running_weights,
-                            self._reassignment_ratio,
-                            random_state,
-                        )
+                    if reassign and step % _REASSIGNMENT_PERIOD == 0:
+                        _split_unused_clusters(centers, running_weights, random_state)
 
         # Set each center to the mean of the samples assigned to it during the
         # last epoch.
@@ -510,7 +466,6 @@ class EMeans(_BaseKMeans):
         self.cluster_centers_ = centers
         self._n_features_out = self.cluster_centers_.shape[0]
         self.batch_size_ = self._batch_size
-        self.learning_rate_init_ = self._learning_rate_init
         self.n_steps_ = n_steps
 
         self.labels_, self.inertia_ = _labels_inertia_threadpool_limit(

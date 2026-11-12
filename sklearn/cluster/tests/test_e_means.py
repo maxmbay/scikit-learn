@@ -5,7 +5,11 @@ import pytest
 from threadpoolctl import threadpool_limits
 
 from sklearn.cluster import EMeans
-from sklearn.cluster._e_means import _scheduled_learning_rate, _split_unused_clusters
+from sklearn.cluster._e_means import (
+    _learning_rate_law,
+    _scheduled_learning_rate,
+    _split_unused_clusters,
+)
 from sklearn.cluster._e_means_minibatch import _ema_update, _minibatch_statistics
 from sklearn.datasets import make_blobs
 from sklearn.metrics import pairwise_distances_argmin
@@ -32,18 +36,13 @@ def test_e_means_results(dtype):
 
 
 def test_e_means_full_batch_is_lloyd_iteration():
-    # With a single epoch made of a single batch and a learning rate of 1, the
-    # e-means update is one iteration of Lloyd's algorithm.
+    # With a single epoch made of a single batch, the final centers are the means
+    # of the samples assigned to each initial center, as after one iteration of
+    # Lloyd's algorithm.
     X = np.random.RandomState(0).uniform(size=(100, 4))
     init = X[:3].copy()
 
-    emeans = EMeans(
-        n_clusters=3,
-        init=init,
-        n_epochs=1,
-        batch_size=X.shape[0],
-        learning_rate_init=1,
-    ).fit(X)
+    emeans = EMeans(n_clusters=3, init=init, n_epochs=1, batch_size=X.shape[0]).fit(X)
 
     labels = pairwise_distances_argmin(X, init)
     expected_centers = [X[labels == j].mean(axis=0) for j in range(3)]
@@ -87,7 +86,7 @@ def test_e_means_reference_implementation():
         [-0.5204016, 0.560384, -0.11574496],
     ]
     assert emeans.batch_size_ == 4
-    assert emeans.learning_rate_init_ == pytest.approx(0.0814347731973082)
+    assert _learning_rate_law(300, 6, 5, 4) == pytest.approx(0.0814347731973082)
     assert emeans.n_steps_ == 375
     assert_allclose(emeans.cluster_centers_, expected_centers)
 
@@ -100,8 +99,8 @@ def test_e_means_reference_implementation():
         (10_000, 2, 10, 5, "auto", 64, 0.16123550575909054),
         (20_000, 16, 50, 3, "auto", 128, 0.11061388834829086),
         (20_000, 17, 50, 3, "auto", 1024, 0.7192196997266359),
-        (5_000, 4, 8, 2.5, "throughput", 128, 0.49027924080125734),
-        (5_000, 4, 8, 2.5, "quality", 16, 0.0754035147008455),
+        (5_000, 17, 8, 2.5, "auto", 128, 0.49027924080125734),
+        (5_000, 4, 8, 2.5, "auto", 16, 0.0754035147008455),
         (10_000, 2, 10, 5, 256, 256, 0.5616881924308813),
     ],
 )
@@ -115,21 +114,17 @@ def test_e_means_scaling_laws(
     expected_learning_rate,
 ):
     # Check the batch size and the initial learning rate set by the scaling laws.
+    # The batches are about 8 times smaller for data with 16 features or less.
     X = np.random.RandomState(0).uniform(size=(n_samples, n_features))
     emeans = EMeans(
         n_clusters=n_clusters, n_epochs=n_epochs, batch_size=batch_size
     ).fit(X)
 
     assert emeans.batch_size_ == expected_batch_size
-    assert emeans.learning_rate_init_ == pytest.approx(expected_learning_rate)
-
-
-def test_e_means_learning_rate_init():
-    # Check that a given initial learning rate is not overridden.
-    X = np.random.RandomState(0).uniform(size=(100, 2))
-    emeans = EMeans(n_clusters=3, learning_rate_init=0.3).fit(X)
-
-    assert emeans.learning_rate_init_ == 0.3
+    learning_rate = _learning_rate_law(
+        n_samples, n_clusters, n_epochs, emeans.batch_size_
+    )
+    assert learning_rate == pytest.approx(expected_learning_rate)
 
 
 @pytest.mark.parametrize(
@@ -221,7 +216,7 @@ def test_split_unused_clusters():
     running_weights = np.array([10.0, 1e-6])
 
     n_reassigned = _split_unused_clusters(
-        centers, running_weights, 0.1, np.random.RandomState(0)
+        centers, running_weights, np.random.RandomState(0)
     )
 
     assert n_reassigned == 1
@@ -231,7 +226,7 @@ def test_split_unused_clusters():
     assert_allclose(running_weights, [5.0, 5.0])
 
     # No cluster is reassigned when the running weights are balanced.
-    assert _split_unused_clusters(centers, running_weights, 0.1, None) == 0
+    assert _split_unused_clusters(centers, running_weights, None) == 0
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
@@ -241,7 +236,7 @@ def test_split_unused_clusters_center_at_origin(dtype):
     centers = np.array([[0.0, 0.0, 0.0], [100.0, 100.0, 100.0]], dtype=dtype)
     running_weights = np.array([10.0, 1e-6], dtype=dtype)
 
-    _split_unused_clusters(centers, running_weights, 0.1, np.random.RandomState(0))
+    _split_unused_clusters(centers, running_weights, np.random.RandomState(0))
 
     assert centers.dtype == dtype
     assert_array_equal(centers[0], 0)
@@ -249,22 +244,14 @@ def test_split_unused_clusters_center_at_origin(dtype):
     assert_array_equal(centers[1, 1:], 0)
 
 
-@pytest.mark.parametrize(
-    "n_features, reassignment_ratio, expected_n_used",
-    [(3, "auto", 4), (3, 0, 2), (2, "auto", 2), (2, 0.1, 4)],
-)
-def test_e_means_reassignment(n_features, reassignment_ratio, expected_n_used):
-    # Check that clusters without samples are reassigned, unless reassignments
-    # are disabled, which "auto" does for data with 2 features or less.
+@pytest.mark.parametrize("n_features, expected_n_used", [(3, 4), (2, 2)])
+def test_e_means_reassignment(n_features, expected_n_used):
+    # Check that clusters without samples are reassigned, except for data with 2
+    # features or less.
     X, _ = make_blobs(n_samples=1000, n_features=n_features, centers=4, random_state=0)
     init = np.concatenate([X[:2], np.full((2, n_features), 1e3)])
 
-    emeans = EMeans(
-        n_clusters=4,
-        init=init,
-        reassignment_ratio=reassignment_ratio,
-        random_state=0,
-    ).fit(X)
+    emeans = EMeans(n_clusters=4, init=init, random_state=0).fit(X)
 
     assert np.unique(emeans.labels_).size == expected_n_used
 
