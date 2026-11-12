@@ -51,7 +51,8 @@ def _minibatch_statistics(
         mini-batch.
 
     n_threads : int
-        The number of threads to be used by openmp to assign the samples.
+        The number of threads to be used by openmp to assign the samples. At
+        most one thread per chunk of the mini-batch is used.
     """
     cdef:
         int n_samples = indices.shape[0]

@@ -14,7 +14,6 @@ from sklearn.cluster._e_means_minibatch import _ema_update, _minibatch_statistic
 from sklearn.datasets import make_blobs
 from sklearn.metrics import pairwise_distances_argmin
 from sklearn.metrics.cluster import v_measure_score
-from sklearn.utils._openmp_helpers import _openmp_effective_n_threads
 from sklearn.utils._testing import assert_allclose, assert_array_equal
 
 
@@ -288,12 +287,11 @@ def test_e_means_init_does_not_modify_inputs():
     assert_array_equal(X, X_copy)
 
 
-def test_e_means_n_threads(monkeypatch):
+def test_e_means_n_threads():
     # Check that the result does not depend on the number of threads: the
     # samples of a mini-batch are assigned in parallel but summed sequentially.
     X, _ = make_blobs(n_samples=3000, centers=10, n_features=5, random_state=0)
-    # Use several threads even though the mini-batches are small.
-    monkeypatch.setattr("sklearn.cluster._e_means._MIN_BATCH_WORK_FOR_THREADS", 0)
+    # Mini-batches of 4 chunks, so that several threads can be used.
     emeans = EMeans(n_clusters=10, batch_size=1024, random_state=0)
 
     with threadpool_limits(limits=1, user_api="openmp"):
@@ -302,29 +300,6 @@ def test_e_means_n_threads(monkeypatch):
         centers_2 = emeans.fit(X).cluster_centers_
 
     assert_array_equal(centers_1, centers_2)
-
-
-def test_e_means_batch_n_threads(monkeypatch):
-    # Check that the assignment of the samples of a mini-batch only uses several
-    # threads when the mini-batches are large enough.
-    X = np.random.RandomState(0).uniform(size=(1000, 2))
-    n_threads_used = set()
-
-    def minibatch_statistics(*args):
-        # n_threads is the last argument.
-        n_threads_used.add(args[-1])
-        return _minibatch_statistics(*args)
-
-    monkeypatch.setattr(
-        "sklearn.cluster._e_means._minibatch_statistics", minibatch_statistics
-    )
-    EMeans(n_clusters=3, n_epochs=1).fit(X)
-    assert n_threads_used == {1}
-
-    n_threads_used.clear()
-    monkeypatch.setattr("sklearn.cluster._e_means._MIN_BATCH_WORK_FOR_THREADS", 0)
-    EMeans(n_clusters=3, n_epochs=1).fit(X)
-    assert n_threads_used == {_openmp_effective_n_threads()}
 
 
 def test_e_means_n_samples_lt_n_clusters():

@@ -63,11 +63,6 @@ _REASSIGNMENT_RATIO = 0.1
 # Unused clusters are not reassigned up to this number of features.
 _NO_REASSIGNMENT_MAX_FEATURES = 2
 
-# The assignment of the samples of a mini-batch to their closest center only
-# uses several threads when batch_size * n_clusters * n_features is at least
-# this value: below, waking up the threads costs more than it saves.
-_MIN_BATCH_WORK_FOR_THREADS = 2**24
-
 
 def _round_to_power_of_two(value):
     """Round a positive number to the closest power of two on a log scale."""
@@ -396,15 +391,13 @@ class EMeans(_BaseKMeans):
 
         self._check_mkl_vcomp(X, self._batch_size)
 
-        # Number of threads used to assign the samples of a mini-batch.
-        batch_work = self._batch_size * self.n_clusters * X.shape[1]
-        n_threads_batch = (
-            self._n_threads if batch_work >= _MIN_BATCH_WORK_FOR_THREADS else 1
-        )
-
+        # Only the k-means++ initialization uses the squared norms of the samples.
+        x_squared_norms = None
+        if isinstance(init, str) and init == "k-means++":
+            x_squared_norms = row_norms(X, squared=True)
         centers = self._init_centroids(
             X,
-            x_squared_norms=row_norms(X, squared=True),
+            x_squared_norms=x_squared_norms,
             init=init,
             random_state=random_state,
             sample_weight=sample_weight,
@@ -444,7 +437,7 @@ class EMeans(_BaseKMeans):
                         sums,
                         counts,
                         labels,
-                        n_threads_batch,
+                        self._n_threads,
                     )
                     learning_rate = _scheduled_learning_rate(
                         self._learning_rate_init, step, n_steps
