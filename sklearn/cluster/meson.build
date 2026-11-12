@@ -1,6 +1,8 @@
 cluster_extension_metadata = {
   '_dbscan_inner':
     {'sources': [cython_gen_cpp.process('_dbscan_inner.pyx')]},
+  '_e_means_minibatch':
+    {'sources': [cython_gen.process('_e_means_minibatch.pyx')], 'dependencies': [openmp_dep]},
   '_hierarchical_fast':
     {'sources': [cython_gen_cpp.process('_hierarchical_fast.pyx'), metrics_cython_tree]},
   '_k_means_common':

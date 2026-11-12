@@ -19,6 +19,7 @@ from sklearn.cluster import (
     AgglomerativeClustering,
     Birch,
     BisectingKMeans,
+    EMeans,
     FeatureAgglomeration,
     KMeans,
     MeanShift,
@@ -214,6 +215,7 @@ INIT_PARAMS = {
     # the default strategy prior would output constant predictions and fail
     # for check_classifiers_predictions
     DummyClassifier: [dict(strategy="stratified"), dict(strategy="most_frequent")],
+    EMeans: dict(n_clusters=2, n_epochs=2),
     ElasticNetCV: dict(max_iter=5, cv=3),
     ElasticNet: dict(max_iter=5),
     ExtraTreesClassifier: dict(n_estimators=5),
