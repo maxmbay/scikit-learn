@@ -3,30 +3,25 @@
 
 from cython cimport floating
 from cython.parallel cimport parallel, prange
-from libc.float cimport DBL_MAX, FLT_MAX
 from libc.stdlib cimport free, malloc
 from libc.string cimport memcpy, memset
 
 from sklearn.cluster._k_means_common import CHUNK_SIZE
-from sklearn.cluster._k_means_common cimport _euclidean_dense_dense
-from sklearn.cluster._k_means_common cimport _euclidean_sparse_dense
 from sklearn.utils._cython_blas cimport _gemm
 from sklearn.utils._cython_blas cimport RowMajor, Trans, NoTrans
 from sklearn.utils._typedefs cimport intp_t
 from sklearn.utils.extmath import row_norms
 
 
-def _minibatch_statistics_dense(
+def _minibatch_statistics(
         const floating[:, ::1] X,            # IN
-        const floating[::1] sample_weight,   # IN
         const intp_t[::1] indices,           # IN
         const floating[:, ::1] centers,      # IN
         floating[:, ::1] sums,               # OUT
-        floating[::1] weight_sums,           # OUT
+        floating[::1] counts,                # OUT
         int[::1] labels,                     # OUT
-        int n_threads,
-        bint compute_inertia=False):
-    """Assign the samples of a mini-batch and sum them by cluster, dense input.
+        int n_threads):
+    """Assign the samples of a mini-batch and sum them by cluster.
 
     The samples are assigned to their closest center in parallel, over chunks of
     the mini-batch. They are then summed sequentially, in the order of the
@@ -37,9 +32,6 @@ def _minibatch_statistics_dense(
     X : ndarray of shape (n_samples, n_features), dtype=floating
         The observations to cluster.
 
-    sample_weight : ndarray of shape (n_samples,), dtype=floating
-        The weights for each observation in X.
-
     indices : ndarray of shape (batch_size,), dtype=intp
         The indices of the samples of the mini-batch.
 
@@ -47,12 +39,12 @@ def _minibatch_statistics_dense(
         The cluster centers.
 
     sums : ndarray of shape (n_clusters, n_features), dtype=floating
-        Placeholder for the weighted sums of the samples of the mini-batch
-        assigned to each center.
+        Placeholder for the sums of the samples of the mini-batch assigned to
+        each center.
 
-    weight_sums : ndarray of shape (n_clusters,), dtype=floating
-        Placeholder for the sums of the weights of the samples of the mini-batch
-        assigned to each center.
+    counts : ndarray of shape (n_clusters,), dtype=floating
+        Placeholder for the number of samples of the mini-batch assigned to
+        each center.
 
     labels : ndarray of shape (>= batch_size,), dtype=int
         Placeholder for the index of the closest center of each sample of the
@@ -60,16 +52,6 @@ def _minibatch_statistics_dense(
 
     n_threads : int
         The number of threads to be used by openmp to assign the samples.
-
-    compute_inertia : bool, default=False
-        Whether to compute the inertia of the mini-batch.
-
-    Returns
-    -------
-    inertia : float
-        Sum of the squared distances of the samples of the mini-batch to their
-        closest center, weighted by the sample weights. It is 0 if
-        `compute_inertia` is False.
     """
     cdef:
         int n_samples = indices.shape[0]
@@ -78,14 +60,12 @@ def _minibatch_statistics_dense(
 
         int i, k, label
         intp_t sample_idx
-        floating weight
-        double inertia = 0
 
     memset(&sums[0, 0], 0, n_clusters * n_features * sizeof(floating))
-    memset(&weight_sums[0], 0, n_clusters * sizeof(floating))
+    memset(&counts[0], 0, n_clusters * sizeof(floating))
 
     if n_samples == 0:
-        return inertia
+        return
 
     cdef:
         # Same chunks as for an iteration of Lloyd's algorithm.
@@ -118,7 +98,7 @@ def _minibatch_statistics_dense(
             else:
                 end = start + n_samples_chunk
 
-            _assign_chunk_dense(
+            _assign_chunk(
                 X,
                 indices[start: end],
                 centers,
@@ -134,20 +114,13 @@ def _minibatch_statistics_dense(
         for i in range(n_samples):
             sample_idx = indices[i]
             label = labels[i]
-            weight = sample_weight[sample_idx]
 
-            weight_sums[label] += weight
+            counts[label] += 1
             for k in range(n_features):
-                sums[label, k] += weight * X[sample_idx, k]
-
-            if compute_inertia:
-                inertia += weight * _euclidean_dense_dense(
-                    &X[sample_idx, 0], &centers[label, 0], n_features, True)
-
-    return inertia
+                sums[label, k] += X[sample_idx, k]
 
 
-cdef void _assign_chunk_dense(
+cdef void _assign_chunk(
         const floating[:, ::1] X,                   # IN
         const intp_t[::1] indices,                  # IN
         const floating[:, ::1] centers,             # IN
@@ -155,7 +128,7 @@ cdef void _assign_chunk_dense(
         int[::1] labels,                            # OUT
         floating *X_chunk,                          # TMP
         floating *pairwise_distances) noexcept nogil:  # TMP
-    """Assign the samples of a chunk of a dense mini-batch to their closest center."""
+    """Assign the samples of a chunk of a mini-batch to their closest center."""
     cdef:
         int n_samples = indices.shape[0]
         int n_clusters = centers.shape[0]
@@ -194,183 +167,16 @@ cdef void _assign_chunk_dense(
         labels[i] = label
 
 
-def _minibatch_statistics_sparse(
-        X,                                   # IN
-        const floating[::1] sample_weight,   # IN
-        const intp_t[::1] indices,           # IN
-        const floating[:, ::1] centers,      # IN
-        floating[:, ::1] sums,               # OUT
-        floating[::1] weight_sums,           # OUT
-        int[::1] labels,                     # OUT
-        int n_threads,
-        bint compute_inertia=False):
-    """Assign the samples of a mini-batch and sum them by cluster, sparse input.
-
-    The samples are assigned to their closest center in parallel, over chunks of
-    the mini-batch. They are then summed sequentially, in the order of the
-    mini-batch, so that the result does not depend on the number of threads.
-
-    Parameters
-    ----------
-    X : sparse matrix of shape (n_samples, n_features), dtype=floating
-        The observations to cluster. Must be in CSR format.
-
-    sample_weight : ndarray of shape (n_samples,), dtype=floating
-        The weights for each observation in X.
-
-    indices : ndarray of shape (batch_size,), dtype=intp
-        The indices of the samples of the mini-batch.
-
-    centers : ndarray of shape (n_clusters, n_features), dtype=floating
-        The cluster centers.
-
-    sums : ndarray of shape (n_clusters, n_features), dtype=floating
-        Placeholder for the weighted sums of the samples of the mini-batch
-        assigned to each center.
-
-    weight_sums : ndarray of shape (n_clusters,), dtype=floating
-        Placeholder for the sums of the weights of the samples of the mini-batch
-        assigned to each center.
-
-    labels : ndarray of shape (>= batch_size,), dtype=int
-        Placeholder for the index of the closest center of each sample of the
-        mini-batch.
-
-    n_threads : int
-        The number of threads to be used by openmp to assign the samples.
-
-    compute_inertia : bool, default=False
-        Whether to compute the inertia of the mini-batch.
-
-    Returns
-    -------
-    inertia : float
-        Sum of the squared distances of the samples of the mini-batch to their
-        closest center, weighted by the sample weights. It is 0 if
-        `compute_inertia` is False.
-    """
-    cdef:
-        int n_samples = indices.shape[0]
-        int n_features = centers.shape[1]
-        int n_clusters = centers.shape[0]
-
-        const floating[::1] X_data = X.data
-        const int[::1] X_indices = X.indices
-        const int[::1] X_indptr = X.indptr
-
-        int i, k, label
-        intp_t sample_idx
-        floating weight
-        double inertia = 0
-
-    memset(&sums[0, 0], 0, n_clusters * n_features * sizeof(floating))
-    memset(&weight_sums[0], 0, n_clusters * sizeof(floating))
-
-    if n_samples == 0:
-        return inertia
-
-    cdef:
-        # Same chunks as for an iteration of Lloyd's algorithm. Splitting in
-        # chunks is necessary to get parallelism.
-        int n_samples_chunk = CHUNK_SIZE if n_samples > CHUNK_SIZE else n_samples
-        int n_chunks = n_samples // n_samples_chunk
-        int n_samples_rem = n_samples % n_samples_chunk
-        int chunk_idx
-        int start, end
-
-        floating[::1] centers_squared_norms = row_norms(centers, squared=True)
-
-    # count remainder chunk in total number of chunks
-    n_chunks += n_samples != n_chunks * n_samples_chunk
-
-    # number of threads should not be bigger than number of chunks
-    n_threads = min(n_threads, n_chunks)
-
-    for chunk_idx in prange(n_chunks, schedule='static', nogil=True, num_threads=n_threads):
-        start = chunk_idx * n_samples_chunk
-        if chunk_idx == n_chunks - 1 and n_samples_rem > 0:
-            end = start + n_samples_rem
-        else:
-            end = start + n_samples_chunk
-
-        _assign_chunk_sparse(
-            X_data,
-            X_indices,
-            X_indptr,
-            indices[start: end],
-            centers,
-            centers_squared_norms,
-            labels[start: end])
-
-    with nogil:
-        for i in range(n_samples):
-            sample_idx = indices[i]
-            label = labels[i]
-            weight = sample_weight[sample_idx]
-
-            weight_sums[label] += weight
-            for k in range(X_indptr[sample_idx], X_indptr[sample_idx + 1]):
-                sums[label, X_indices[k]] += weight * X_data[k]
-
-            if compute_inertia:
-                inertia += weight * _euclidean_sparse_dense(
-                    X_data[X_indptr[sample_idx]: X_indptr[sample_idx + 1]],
-                    X_indices[X_indptr[sample_idx]: X_indptr[sample_idx + 1]],
-                    centers[label], centers_squared_norms[label], True)
-
-    return inertia
-
-
-cdef void _assign_chunk_sparse(
-        const floating[::1] X_data,                 # IN
-        const int[::1] X_indices,                   # IN
-        const int[::1] X_indptr,                    # IN
-        const intp_t[::1] indices,                  # IN
-        const floating[:, ::1] centers,             # IN
-        const floating[::1] centers_squared_norms,  # IN
-        int[::1] labels) noexcept nogil:            # OUT
-    """Assign the samples of a chunk of a sparse mini-batch to their closest center."""
-    cdef:
-        int n_samples = indices.shape[0]
-        int n_clusters = centers.shape[0]
-
-        floating sq_dist, min_sq_dist
-        floating max_floating = FLT_MAX if floating is float else DBL_MAX
-        int i, j, k, label
-        intp_t sample_idx
-
-    for i in range(n_samples):
-        sample_idx = indices[i]
-        min_sq_dist = max_floating
-        label = 0
-
-        for j in range(n_clusters):
-            sq_dist = 0.0
-            for k in range(X_indptr[sample_idx], X_indptr[sample_idx + 1]):
-                sq_dist += centers[j, X_indices[k]] * X_data[k]
-
-            # Instead of computing the full squared distance with each cluster,
-            # ||X - C||² = ||X||² - 2 X.C^T + ||C||², we only need to compute
-            # the - 2 X.C^T + ||C||² term since the argmin for a given sample
-            # only depends on the centers C.
-            sq_dist = centers_squared_norms[j] - 2 * sq_dist
-            if sq_dist < min_sq_dist:
-                min_sq_dist = sq_dist
-                label = j
-
-        labels[i] = label
-
-
 def _ema_update(
         floating[:, ::1] centers,            # INOUT
         floating[::1] running_weights,       # INOUT
-        const floating[::1] weight_sums,     # IN
+        const floating[::1] counts,          # IN
         const floating[:, ::1] sums,         # IN
         double learning_rate):
     """Update the centers with the statistics of a mini-batch, in place.
 
     The running weight N_j and the running sum S_j of the samples assigned to
-    cluster j are exponential moving averages of the weight n_j and the sum s_j
+    cluster j are exponential moving averages of the number n_j and the sum s_j
     of the samples of the mini-batch assigned to it, and the center of the
     cluster is S_j / N_j:
 
@@ -387,13 +193,11 @@ def _ema_update(
     running_weights : ndarray of shape (n_clusters,), dtype=floating
         The running weights of the clusters, N_j.
 
-    weight_sums : ndarray of shape (n_clusters,), dtype=floating
-        The sums of the weights of the samples of the mini-batch assigned to
-        each center, n_j.
+    counts : ndarray of shape (n_clusters,), dtype=floating
+        The number of samples of the mini-batch assigned to each center, n_j.
 
     sums : ndarray of shape (n_clusters, n_features), dtype=floating
-        The weighted sums of the samples of the mini-batch assigned to each
-        center, s_j.
+        The sums of the samples of the mini-batch assigned to each center, s_j.
 
     learning_rate : float
         The learning rate, in (0, 1].
@@ -415,21 +219,21 @@ def _ema_update(
         if learning_rate < 1:
             running_weights[j] *= decay
 
-        if weight_sums[j] > 0:
-            batch_weight = alpha * weight_sums[j]
+        if counts[j] > 0:
+            batch_weight = alpha * counts[j]
             if learning_rate < 1:
                 new_weight = running_weights[j] + batch_weight
             else:
-                new_weight = weight_sums[j]
+                new_weight = counts[j]
             running_weights[j] = new_weight
 
             # c_j <- c_j + step_size * (s_j / n_j - c_j)
             step_size = batch_weight / new_weight
             if step_size == 1:
                 for k in range(n_features):
-                    centers[j, k] = sums[j, k] / weight_sums[j]
+                    centers[j, k] = sums[j, k] / counts[j]
             else:
                 for k in range(n_features):
-                    shift = sums[j, k] / weight_sums[j] - centers[j, k]
+                    shift = sums[j, k] / counts[j] - centers[j, k]
                     shift *= step_size
                     centers[j, k] += shift

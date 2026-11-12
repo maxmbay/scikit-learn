@@ -982,15 +982,6 @@ PER_ESTIMATOR_XFAIL_CHECKS: dict[type, dict[str, str]] = {
         "check_methods_subset_invariance": "fails for the predict method",
         "check_methods_sample_order_invariance": "fails for the predict method",
     },
-    EMeans: {
-        # TODO: replace by a statistical test, see meta-issue #16298
-        "check_sample_weight_equivalence_on_dense_data": (
-            "sample_weight is not equivalent to removing/repeating samples."
-        ),
-        "check_sample_weight_equivalence_on_sparse_data": (
-            "sample_weight is not equivalent to removing/repeating samples."
-        ),
-    },
     FeatureUnion: {
         # Fails because StandardScaler, which gets wrapped by FeatureUnion, supports
         # array API but FeatureUnion itself does not

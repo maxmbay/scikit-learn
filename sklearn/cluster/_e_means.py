@@ -8,14 +8,9 @@ import warnings
 from numbers import Integral, Real
 
 import numpy as np
-import scipy.sparse as sp
 
 from sklearn.base import _fit_context
-from sklearn.cluster._e_means_minibatch import (
-    _ema_update,
-    _minibatch_statistics_dense,
-    _minibatch_statistics_sparse,
-)
+from sklearn.cluster._e_means_minibatch import _ema_update, _minibatch_statistics
 from sklearn.cluster._k_means_common import CHUNK_SIZE
 from sklearn.cluster._kmeans import _BaseKMeans, _labels_inertia_threadpool_limit
 from sklearn.utils._openmp_helpers import _openmp_effective_n_threads
@@ -23,7 +18,6 @@ from sklearn.utils._param_validation import Interval, StrOptions
 from sklearn.utils.extmath import row_norms
 from sklearn.utils.parallel import _get_threadpool_controller
 from sklearn.utils.validation import (
-    _check_sample_weight,
     _is_arraylike_not_scalar,
     check_array,
     check_random_state,
@@ -49,7 +43,7 @@ _LEARNING_RATE_LAW = (0.8244, -0.4617, 0.9003, -0.4498, -0.1057)
 # _FINAL_LEARNING_RATE_RATIO * learning_rate_init along a cosine schedule.
 _FINAL_LEARNING_RATE_RATIO = 0.1
 
-# Initial running weight of each cluster, relative to the mean sample weight.
+# Initial running weight of each cluster.
 _INITIAL_RUNNING_WEIGHT = 2.0**-16
 
 # Number of mini-batch steps between two reassignments of unused clusters.
@@ -182,7 +176,7 @@ class EMeans(_BaseKMeans):
     """E-means clustering.
 
     Mini-batch k-means where each center is the ratio of exponential moving
-    averages of the sums and the weights of the samples assigned to it. The
+    averages of the sums and the numbers of the samples assigned to it. The
     learning rate follows a cosine decay, and the batch size and the initial
     learning rate are set by empirical scaling laws, so that the number of
     passes over the data, `n_epochs`, is in general the only parameter to set.
@@ -242,9 +236,6 @@ class EMeans(_BaseKMeans):
         reassignments. "auto" uses 0.1, except when `n_features <= 2` where it
         disables the reassignments.
 
-    verbose : int, default=0
-        Verbosity mode.
-
     random_state : int, RandomState instance or None, default=None
         Determines random number generation for centroid initialization, for
         the order of the samples in each epoch and for the reassignments. Use
@@ -260,8 +251,7 @@ class EMeans(_BaseKMeans):
         Labels of each point.
 
     inertia_ : float
-        Sum of squared distances of samples to their closest cluster center,
-        weighted by the sample weights if provided.
+        Sum of squared distances of samples to their closest cluster center.
 
     batch_size_ : int
         Batch size used during fit.
@@ -338,7 +328,6 @@ class EMeans(_BaseKMeans):
             Interval(Real, 0, None, closed="left"),
             StrOptions({"auto"}),
         ],
-        "verbose": ["verbose"],
         "random_state": ["random_state"],
     }
 
@@ -351,7 +340,6 @@ class EMeans(_BaseKMeans):
         batch_size="auto",
         learning_rate_init=None,
         reassignment_ratio="auto",
-        verbose=0,
         random_state=None,
     ):
         self.n_clusters = n_clusters
@@ -360,7 +348,6 @@ class EMeans(_BaseKMeans):
         self.batch_size = batch_size
         self.learning_rate_init = learning_rate_init
         self.reassignment_ratio = reassignment_ratio
-        self.verbose = verbose
         self.random_state = random_state
 
     def _check_params_vs_input(self, X):
@@ -410,45 +397,31 @@ class EMeans(_BaseKMeans):
         )
 
     @_fit_context(prefer_skip_nested_validation=True)
-    def fit(self, X, y=None, sample_weight=None):
+    def fit(self, X, y=None):
         """Compute the centroids on X by chunking it into mini-batches.
 
         Parameters
         ----------
-        X : {array-like, sparse matrix} of shape (n_samples, n_features)
+        X : array-like of shape (n_samples, n_features)
             Training instances to cluster. It must be noted that the data
             will be converted to C ordering, which will cause a memory copy
             if the given data is not C-contiguous.
-            If a sparse matrix is passed, a copy will be made if it's not in
-            CSR format.
 
         y : Ignored
             Not used, present here for API consistency by convention.
-
-        sample_weight : array-like of shape (n_samples,), default=None
-            The weights for each observation in X. If None, all observations
-            are assigned equal weight. `sample_weight` is not used during
-            initialization if `init` is a callable or a user provided array.
 
         Returns
         -------
         self : object
             Fitted estimator.
         """
-        X = validate_data(
-            self,
-            X,
-            accept_sparse="csr",
-            dtype=[np.float64, np.float32],
-            order="C",
-            accept_large_sparse=False,
-        )
+        X = validate_data(self, X, dtype=[np.float64, np.float32], order="C")
 
         self._check_params_vs_input(X)
         random_state = check_random_state(self.random_state)
-        sample_weight = _check_sample_weight(
-            sample_weight, X, dtype=X.dtype, ensure_non_negative=True
-        )
+        # Unit weights, for the initialization and the computation of labels_
+        # and inertia_.
+        sample_weight = np.ones(X.shape[0], dtype=X.dtype)
         self._n_threads = _openmp_effective_n_threads()
         n_samples = X.shape[0]
 
@@ -461,8 +434,7 @@ class EMeans(_BaseKMeans):
         self._check_mkl_vcomp(X, self._batch_size)
 
         # Number of threads used to assign the samples of a mini-batch.
-        n_features_per_sample = X.nnz / n_samples if sp.issparse(X) else X.shape[1]
-        batch_work = self._batch_size * self.n_clusters * n_features_per_sample
+        batch_work = self._batch_size * self.n_clusters * X.shape[1]
         n_threads_batch = (
             self._n_threads if batch_work >= _MIN_BATCH_WORK_FOR_THREADS else 1
         )
@@ -478,35 +450,20 @@ class EMeans(_BaseKMeans):
         if callable(init):
             # The centers are updated in place: they must not be a view of X.
             centers = centers.copy()
-        # Relative to the mean sample weight, so that the clustering does not
-        # depend on the scale of the sample weights.
         running_weights = np.full(
-            self.n_clusters,
-            _INITIAL_RUNNING_WEIGHT * sample_weight.mean(),
-            dtype=X.dtype,
+            self.n_clusters, _INITIAL_RUNNING_WEIGHT, dtype=X.dtype
         )
 
         epoch_sizes = _epoch_sizes(n_samples, self.n_epochs)
         n_steps = sum(math.ceil(size / self._batch_size) for size in epoch_sizes)
-        if self.verbose:
-            print(
-                f"Clustering with batch_size={self._batch_size} and "
-                f"learning_rate_init={self._learning_rate_init:.3g}: "
-                f"{n_steps} minibatch steps in {len(epoch_sizes)} epochs."
-            )
-
-        if sp.issparse(X):
-            minibatch_statistics = _minibatch_statistics_sparse
-        else:
-            minibatch_statistics = _minibatch_statistics_dense
 
         # Buffers for the statistics of a mini-batch.
         sums = np.empty_like(centers)
-        weight_sums = np.empty(self.n_clusters, dtype=X.dtype)
+        counts = np.empty(self.n_clusters, dtype=X.dtype)
         labels = np.empty(self._batch_size, dtype=np.int32)
         # Statistics of the clusters during the last epoch.
         epoch_sums = np.zeros_like(centers)
-        epoch_weight_sums = np.zeros(self.n_clusters, dtype=X.dtype)
+        epoch_counts = np.zeros(self.n_clusters, dtype=X.dtype)
 
         step = 0
         with _get_threadpool_controller().limit(limits="sequential_blas_under_openmp"):
@@ -514,30 +471,23 @@ class EMeans(_BaseKMeans):
                 is_last_epoch = epoch == len(epoch_sizes) - 1
                 indices = random_state.permutation(n_samples)[:epoch_size]
                 indices = indices.astype(np.intp, copy=False)
-                epoch_inertia = 0
-                n_reassigned = 0
 
                 for start in range(0, epoch_size, self._batch_size):
-                    # The inertia of the batch is only used for verbose output.
-                    epoch_inertia += minibatch_statistics(
+                    _minibatch_statistics(
                         X,
-                        sample_weight,
                         indices[start : start + self._batch_size],
                         centers,
                         sums,
-                        weight_sums,
+                        counts,
                         labels,
                         n_threads_batch,
-                        compute_inertia=bool(self.verbose),
                     )
                     learning_rate = _scheduled_learning_rate(
                         self._learning_rate_init, step, n_steps
                     )
-                    _ema_update(
-                        centers, running_weights, weight_sums, sums, learning_rate
-                    )
+                    _ema_update(centers, running_weights, counts, sums, learning_rate)
                     if is_last_epoch:
-                        epoch_weight_sums += weight_sums
+                        epoch_counts += counts
                         epoch_sums += sums
                     step += 1
 
@@ -545,23 +495,17 @@ class EMeans(_BaseKMeans):
                         self._reassignment_ratio > 0
                         and step % _REASSIGNMENT_PERIOD == 0
                     ):
-                        n_reassigned += _split_unused_clusters(
+                        _split_unused_clusters(
                             centers,
                             running_weights,
                             self._reassignment_ratio,
                             random_state,
                         )
 
-                if self.verbose:
-                    print(
-                        f"Epoch {epoch + 1}/{len(epoch_sizes)}: inertia "
-                        f"{epoch_inertia}, {n_reassigned} reassigned clusters."
-                    )
-
         # Set each center to the mean of the samples assigned to it during the
         # last epoch.
-        assigned = epoch_weight_sums > 0
-        centers[assigned] = epoch_sums[assigned] / epoch_weight_sums[assigned, None]
+        assigned = epoch_counts > 0
+        centers[assigned] = epoch_sums[assigned] / epoch_counts[assigned, None]
 
         self.cluster_centers_ = centers
         self._n_features_out = self.cluster_centers_.shape[0]
@@ -574,3 +518,49 @@ class EMeans(_BaseKMeans):
         )
 
         return self
+
+    def fit_predict(self, X, y=None):
+        """Compute cluster centers and predict cluster index for each sample.
+
+        Convenience method; equivalent to calling fit(X) followed by
+        predict(X).
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            New data to transform.
+
+        y : Ignored
+            Not used, present here for API consistency by convention.
+
+        Returns
+        -------
+        labels : ndarray of shape (n_samples,)
+            Index of the cluster each sample belongs to.
+        """
+        return self.fit(X).labels_
+
+    def fit_transform(self, X, y=None):
+        """Compute clustering and transform X to cluster-distance space.
+
+        Equivalent to fit(X).transform(X), but more efficiently implemented.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            New data to transform.
+
+        y : Ignored
+            Not used, present here for API consistency by convention.
+
+        Returns
+        -------
+        X_new : ndarray of shape (n_samples, n_clusters)
+            X transformed in the new space.
+        """
+        return self.fit(X)._transform(X)
+
+    def __sklearn_tags__(self):
+        tags = super().__sklearn_tags__()
+        tags.input_tags.sparse = False
+        return tags
